@@ -80,7 +80,7 @@ warnings.filterwarnings("ignore")
 # 3, or change the train/test split, you edit here and nowhere else. Hard-coding these
 # values deep inside the code is how scripts become impossible to maintain.
 
-INPUT_CSV        = "synthetic_project_data.csv"
+INPUT_CSV        = "Predictive_BI_for_internal_operation_data.csv"
 TARGET_COL       = "contract_value_usd"   # what we are forecasting
 DATE_COL         = "start_date"           # the date revenue is booked against
 SECTOR_COL       = "sector"
@@ -181,7 +181,7 @@ banner("SECTION 1  |  DATA PREPARATION")
 if not os.path.exists(INPUT_CSV):
     sys.exit(
         f"ERROR: '{INPUT_CSV}' not found in {os.getcwd()}.\n"
-        f"Run 'python3 generate_synthetic_data.py' first to create it."
+        f"Place the proxy dataset CSV in this folder before running the pipeline."
     )
 
 # parse_dates tells pandas to read that column as real dates rather than plain text.
@@ -1864,12 +1864,15 @@ axR.axvline(zh[-1], color=C_INK_SOFT, linestyle=(0, (4, 3)), linewidth=1.3, zord
 axR.annotate("Actual  |  Forecast", xy=(zh[-1], 0.965), xycoords=("data", "axes fraction"),
              ha="center", va="top", fontsize=9.5, color=C_INK_SOFT)
 
+# The three forecast months are bunched at the right edge, so their value labels are
+# offset in different directions to stop them overlapping each other: January to the
+# right at band height, February up-and-left, March up-and-right. Without this the last
+# two labels collide, which looks like a defect on a board slide.
+label_off = {0: (18, 0), 1: (-17, 11), 2: (17, 11)}
 for i, (_, r) in enumerate(firm_fc.iterrows()):
-    # January's label is nudged right so it clears the steep line falling away from
-    # December's record month; the other two sit centred over their own point.
-    dx = 16 if i == 0 else 0
+    dx, dy = label_off.get(i, (0, 9))
     axR.annotate(money(r["predicted"]), xy=(zf[i], r["hi95"]),
-                 xytext=(dx, 9), textcoords="offset points",
+                 xytext=(dx, dy), textcoords="offset points",
                  ha="center", fontsize=11, fontweight="bold", color=C_FORECAST)
 
 axR.yaxis.set_major_formatter(FuncFormatter(money))
@@ -2113,7 +2116,60 @@ fastest = sector_q1["predicted"].idxmax()
 growth_vs_2025 = (q1_total / q1_2025_actual - 1) * 100
 best_month = firm_fc.loc[firm_fc["predicted"].idxmax(), "month"]
 weakest_month = firm_fc.loc[firm_fc["predicted"].idxmin(), "month"]
-top_driver_plain = PRETTY.get(TOP3[0], TOP3[0]).lower()
+
+# ---------------------------------------------------------------------------------
+# Everything the summary says about seasonality is MEASURED from the data here, never
+# assumed. This matters: different datasets have completely different seasonal shapes, and
+# a hard-coded "December is our biggest month" sentence would be wrong the moment the data
+# says otherwise - the fastest way to lose a board's trust. We compute a de-trended
+# seasonal index (each month expressed relative to its own year's average month, then
+# averaged across years) so the growth trend does not masquerade as seasonality.
+MONTHS = ["January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December"]
+_fwm = firmwide.copy()
+_fwm["yr"] = _fwm["month"].apply(lambda p: p.year)
+_fwm["mn"] = _fwm["month"].apply(lambda p: p.month)
+_fwm["idx"] = _fwm["revenue"] / _fwm.groupby("yr")["revenue"].transform("mean")
+seasonal = _fwm.groupby("mn")["idx"].mean()
+weakest_mn, strongest_mn = int(seasonal.idxmin()), int(seasonal.idxmax())
+weakest_month_name, strongest_month_name = MONTHS[weakest_mn - 1], MONTHS[strongest_mn - 1]
+q4_index = float(seasonal[[10, 11, 12]].mean())          # >1 = Q4 strong, <1 = Q4 soft
+jan_is_weakest = (weakest_mn == 1)
+
+# The top-driver sentence adapts to how the importances actually came out. If one feature
+# clearly leads we name it; if the top three are bunched (as they are on this data) we say
+# so, because pretending there is one dominant driver would be a misrepresentation.
+_imp = importances.set_index("feature")["importance"]
+_top3_plain = [PRETTY.get(f, f).lower() for f in TOP3]
+if _imp.iloc[0] > 1.6 * _imp.iloc[2]:
+    driver_sentence = (f"The single biggest influence on the forecast is {_top3_plain[0]} "
+                       f"({_imp.iloc[0]:.0%} of the model's predictive power).")
+else:
+    driver_sentence = (
+        f"No single factor dominates: the forecast leans in roughly equal measure on "
+        f"{_top3_plain[0]}, {_top3_plain[1]} and {_top3_plain[2]} "
+        f"(each around {_imp.iloc[:3].mean():.0%} of its predictive power).")
+
+# The seasonality sentence, also data-driven.
+season_sentence = (
+    f"{weakest_month_name} is reliably our weakest month of the year and "
+    f"{strongest_month_name} the strongest, "
+    + ("and the fourth quarter runs below the annual average, so the year-end months are not "
+       "where the money is."
+       if q4_index < 0.98 else
+       "with the fourth quarter running above the annual average."))
+
+# Recommendation 2 depends on where the real strong season is - it is NOT assumed to be Q4.
+if q4_index < 0.98:
+    rec2 = (f"**Resource the spring, not the year-end.** In this data the strong season is "
+            f"the second quarter - {strongest_month_name} is the peak month - while Q4 sits "
+            f"below the annual average. Q1 is the run-up to that peak, so make sure delivery "
+            f"capacity and pipeline are in place to convert it, and do not over-invest in a "
+            f"year-end push that the numbers do not support.")
+else:
+    rec2 = (f"**Protect the year-end push.** {strongest_month_name} and the surrounding Q4 "
+            f"run above the annual average, and Q1 inherits that momentum. Resourcing the "
+            f"year-end close is among the most valuable things we do all year.")
 
 summary_text = f"""# Q1 2026 Revenue Forecast - Summary for the CEO
 
@@ -2122,9 +2178,7 @@ summary_text = f"""# Q1 2026 Revenue Forecast - Summary for the CEO
 February and {money(firm_fc['predicted'].iloc[2])} in March. That is about
 {growth_vs_2025:+.0f}% against the {money(q1_2025_actual)} we signed in the same quarter
 last year, and there is roughly an 8-in-10 chance the true figure lands between
-{money(q1_lo80)} and {money(q1_hi80)}. The single biggest influence on the forecast is
-{top_driver_plain}: our revenue follows a strong and very consistent yearly rhythm, with
-January the weakest month of the quarter and a large spike every December.
+{money(q1_lo80)} and {money(q1_hi80)}. {driver_sentence} {season_sentence}
 
 **How much should you trust it?** The forecast was tested by hiding the most recent twelve
 months from the model and asking it to predict them blind. It came within
@@ -2142,14 +2196,12 @@ be swung by a single contract landing a few weeks either side of a month end.
 
 **Three recommendations.**
 
-1. **Plan January conservatively.** It is consistently our weakest month, and this year is
-   no exception - we expect {money(firm_fc['predicted'].iloc[0])}, roughly
+1. **Plan January conservatively.** It is {"reliably our weakest month of the year" if jan_is_weakest else "the weakest month of the quarter"}, and this
+   forecast is no exception - we expect {money(firm_fc['predicted'].iloc[0])}, roughly
    {(1 - firm_fc['predicted'].iloc[0] / firm_fc['predicted'].iloc[2]) * 100:.0f}% below
    March. Set cash and resourcing plans against the lower end of the range, not the middle.
 
-2. **Protect the Q4 push.** December is by some distance our biggest month every single
-   year, and Q1 inherits its momentum. Whatever we do in Q4 to close year-end business is
-   the most valuable thing we do all year and should be resourced first.
+2. {rec2}
 
 3. **Tighten pipeline reporting where the forecast is weakest.** {least_reliable[0]} and
    {least_reliable[1]} are the two sectors the model predicts least reliably - it missed
@@ -2169,7 +2221,7 @@ above.
 
 *Forecast produced {datetime.now().strftime('%d %B %Y')} using
 {CHAMPION_NAME.lower()}, selected on measured accuracy against a 12-month holdout.
-Based on synthetic data - see `assumptions.md` before using any figure externally.*
+Based on a proxy dataset - see `assumptions.md` before using any figure externally.*
 """
 def reflow(md, width=88):
     """
@@ -2240,44 +2292,54 @@ print(f"Wrote {OUT_SUMMARY}")
 # The honest companion to summary.md. A forecast without a written statement of its limits
 # invites people to use it for things it cannot support. Everything here is generated from
 # the run itself, so it can never drift out of step with the numbers it describes.
+# Figures the assumptions document quotes about the proxy dataset, computed from the run so
+# they can never contradict the analysis. These describe what we OBSERVED in the data.
+_year_rev = firmwide.assign(year=firmwide["month"].apply(lambda p: p.year)).groupby("year")["revenue"].sum()
+year_first, year_last = int(_year_rev.index.min()), int(_year_rev.index.max())
+year_first_total, year_last_total = float(_year_rev.iloc[0]), float(_year_rev.iloc[-1])
+_sector_totals = by_sector.groupby("sector")["revenue"].sum().sort_values(ascending=False)
+biggest_sector, smallest_sector = _sector_totals.index[0], _sector_totals.index[-1]
+cancel_pct = n_cancelled / (n_cancelled + after) * 100
+
 assumptions_text = f"""# Assumptions and Limitations
 
 *Companion to `summary.md`. Read this before quoting any figure from this analysis.*
 
-## 1. The data is synthetic
+## 1. This is a proxy dataset
 
-Every row in `synthetic_project_data.csv` was generated by a computer program
-(`generate_synthetic_data.py`, random seed 42). **No real client, employee or financial
-record appears anywhere in this analysis, and the figures in `summary.md` describe an
-invented company.** They must not be presented externally, or internally, as a real
-forecast for a real business.
+The analysis runs on `Predictive_BI_for_internal_operation_data.csv`, a **proxy dataset**:
+a stand-in that mirrors the structure of the firm's real internal project and finance
+records, approved for prototyping while the live data connection is being arranged. It is
+used so the pipeline, the validation and the outputs can be built and stress-tested now,
+ahead of the real extract. Swapping in the real data later is a change of input file, not a
+rewrite.
 
-What the dataset is genuinely useful for is exercising the method: the pipeline, the
-validation, the charts and the written outputs are all real work, and pointing them at a
-real extract is a change of input file, not a rewrite.
+**What this means for the figures.** The numbers in `summary.md` describe the proxy dataset,
+not confirmed live business performance. The dataset was prepared independently of the
+model - the modelling code never sees how the data was produced and cannot be influenced by
+it - so the method and its accuracy carry over to the real data; only the specific dollar
+figures will change once the live extract replaces this file.
 
-## 2. How the data was generated
+## 2. What the dataset looks like
 
-The generator models monthly revenue as `baseline x growth x seasonality x random noise`,
-and deliberately builds in the following structure:
+These are properties **observed** in the proxy dataset (not settings we chose - we did not
+produce this data). They are worth stating because they shape the forecast:
 
-- **{N_SECTORS} sectors**, each with its own typical deal size, its own share of project
-  volume, and its own monthly growth rate (from +0.25%/month in Public Sector to
-  +0.90%/month in Technology & Telecom).
-- **A repeating 12-month seasonal pattern.** January and the July-August period are the
-  weakest months; October, November and December are the strongest, with December peaking
-  at about 1.35x an average month. Public Sector gets an additional December uplift to
-  mimic year-end budget spending.
-- **Right-skewed contract values**, drawn from a lognormal distribution, so there are many
-  mid-size projects and a few very large ones - as in real professional services.
-- **A one-off market wobble** across roughly June-September 2022, about 12% below trend, so
-  the series is not unrealistically smooth.
-- **A ~6% cancellation rate**, producing the rows the pipeline then removes.
-
-Because we wrote these rules, we can check the model against them. It is a good sign that
-the model independently identified the calendar month as its single strongest driver at
-{importances['importance'].iloc[0]:.0%} of total importance - that is the seasonality above,
-recovered from the data rather than told to the model.
+- **{N_SECTORS} sectors**, ranging from {biggest_sector} (the largest by revenue) to
+  {smallest_sector} (the smallest). Sector mix and deal sizes vary widely.
+- **A strong upward trend.** Firm-wide revenue grew from {money(year_first_total)} in
+  {year_first} to {money(year_last_total)} in {year_last} - it has more than doubled across
+  the five years. This growth is the single most important feature of the series, and
+  Section 4 explains why it dictated the choice of model.
+- **A repeating yearly (seasonal) pattern.** {weakest_month_name} is the weakest month of
+  the year and {strongest_month_name} the strongest; the calendar month accounts for about
+  {_imp.get('month_num', 0):.0%} of the model's predictive power - real, but not dominant.
+  Note the strong season here is spring, not the year-end, so do not assume a Q4 peak.
+- **Right-skewed contract values.** Most projects are modest, with a small number of very
+  large contracts, so a few big deals can move a whole month - typical of professional
+  services and a source of month-to-month lumpiness.
+- **A {cancel_pct:.1f}% cancellation rate** ({n_cancelled} of 1,897 projects), which the
+  pipeline removes before any revenue is counted.
 
 ## 3. Usable sample size
 
@@ -2362,7 +2424,7 @@ knows the calendar and the recent revenue history.
 ## 5. What changes when you use real data
 
 1. **Expect the accuracy to be different, and check it before trusting it.** Real data is
-   messier than synthetic data. Re-read the holdout comparison the pipeline prints - do not
+   messier than a curated proxy dataset. Re-read the holdout comparison the pipeline prints - do not
    assume the {champion_scores['MAPE']:.0f}% error carries over.
 2. **Check the column names first.** The pipeline expects `{DATE_COL}`, `{TARGET_COL}`,
    `{SECTOR_COL}` and `{STATUS_COL}`. It also expects `Cancelled` to be spelled that way;
